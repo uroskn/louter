@@ -373,15 +373,8 @@ convertRequestToBackend backend chatReq =
           -- Build OpenAI request format
 
           -- Serialise as ```content: "quoted text here"```, rather than ```content: [{"type":"text", "text":"quoted text here"}]```
-          messageContent :: [ContentPart] -> Value
-          messageContent parts = case parts of
-                                   [TextPart text] -> String text
-                                   _               -> toJSON parts
 
-          messagesJson = map (\msg -> object
-            [ "role" .= msgRole msg
-            , "content" .= messageContent (msgContent msg)
-            ]) (reqMessages chatReq)
+          messagesJson = map toJSON (reqMessages chatReq)
 
           -- Do not serialize empty members.
           requestBody = encode $ object $
