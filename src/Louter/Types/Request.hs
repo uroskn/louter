@@ -183,7 +183,13 @@ data Tool = Tool
   , toolParameters :: !Value       -- ^ JSON Schema for parameters
   } deriving (Show, Eq, Generic)
 
-instance FromJSON Tool
+instance FromJSON Tool where
+  parseJSON = withObject "Tool" $ \obj -> do
+    func <- obj .: "function"
+    Tool
+      <$> func .: "name"
+      <*> func .:? "description"
+      <*> func .: "parameters"
 
 instance ToJSON Tool where
   toJSON t = object
