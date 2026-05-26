@@ -166,81 +166,82 @@ parseSSEStream manager httpReq = do
 
 -- | Parse SSE chunks from body reader
 parseSSEChunks :: BodyReader -> ConduitT () StreamEvent IO ()
-parseSSEChunks bodyReader = loop BS.empty HMS.empty
+parseSSEChunks bodyReader = loop BS.empty (HMS.empty, "stop")
   where
-    loop acc toolCallState = do
+    loop acc (toolCallState, finishReason) = do
       chunk <- liftIO $ brRead bodyReader
       if BS.null chunk
-        then do
+        then
           -- End of stream - emit any buffered tool calls
           mapM_ emitToolCall (HMS.toList toolCallState)
         else do
           let combined = acc <> chunk
               lines' = BS8.split '\n' combined
           case lines' of
-            [] -> loop BS.empty toolCallState
-            [incomplete] -> loop incomplete toolCallState
+            []           -> loop BS.empty (toolCallState, finishReason)
+            [incomplete] -> loop incomplete (toolCallState, finishReason)
             _ -> do
               let (completeLines, rest) = (init lines', last lines')
-              newState <- foldM processSSELine toolCallState completeLines
+              newState <- foldM processSSELine (toolCallState, finishReason) completeLines
               loop rest newState
 
-    processSSELine state line
+    processSSELine (toolCallState, finishReason) line
       | BS.isPrefixOf "data: " line = do
           let jsonText = TE.decodeUtf8 $ BS.drop 6 line
           if jsonText == "[DONE]"
             then do
               -- Emit all buffered tool calls and finish
-              mapM_ emitToolCall (HMS.toList state)
-              yield (StreamFinish "stop")
-              pure HMS.empty
+              mapM_ emitToolCall (HMS.toList toolCallState)
+              yield (StreamFinish finishReason)
+              pure (HMS.empty, finishReason)
             else case eitherDecode (BL.fromStrict $ TE.encodeUtf8 jsonText) of
-              Right (Object chunk) -> processChunk state chunk
+              Right (Object chunk) -> processChunk (toolCallState, finishReason) chunk
               Left err -> do
                 yield (StreamError $ "Failed to parse JSON: " <> T.pack err)
-                pure state
-              _ -> pure state
-      | otherwise = pure state
+                pure (toolCallState, finishReason)
+              _ -> pure (toolCallState, finishReason)
+      | otherwise = pure (toolCallState, finishReason)
 
-    processChunk state chunk = do
+    processChunk (toolCallState, finishReason) chunk = do
       case HM.lookup "choices" chunk of
         Just (Array choices) | not (V.null choices) -> do
           case V.head choices of
-            Object choice -> processChoice state choice
-            _ -> pure state
-        _ -> pure state
+            Object choice -> processChoice (toolCallState, finishReason) choice
+            _ -> pure (toolCallState, finishReason)
+        _ -> pure (toolCallState, finishReason)
 
-    processChoice state choice = do
+    processChoice (toolCallState, lastFinishReason) choice = do
+      let finishReason = case HM.lookup "finish_reason" choice of
+                           Just (String foundReason) | not (T.null foundReason) -> foundReason
+                           _                                                    -> lastFinishReason
       case HM.lookup "delta" choice of
         Just (Object delta) -> do
           -- Handle content
           newState1 <- case HM.lookup "content" delta of
-            Just (String content) -> do
-              yield (StreamContent content)
-              pure state
-            _ -> pure state
-
+            Just (String "")      -> do
+              liftIO $ putStrLn $ "Warning: Empty content: " <> show delta
+              pure toolCallState -- handle tool calls being sent with content ""
+            Just (String content) -> yield (StreamContent content) >> pure toolCallState
+            _                     -> pure toolCallState
           -- Handle reasoning (o1 models)
           newState2 <- case HM.lookup "reasoning" delta of
-            Just (String reasoning) -> do
-              yield (StreamReasoning reasoning)
-              pure newState1
-            _ -> pure newState1
-
-          -- Handle tool calls (need buffering)
-          case HM.lookup "tool_calls" delta of
+            Just (String reasoning) -> yield (StreamReasoning reasoning) >> pure newState1
+            _                       -> pure newState1
+          -- Handle tool calls
+          newState3 <- case HM.lookup "tool_calls" delta of
             Just (Array toolCalls) -> processToolCalls newState2 toolCalls
-            _ -> pure newState2
-        _ -> pure state
+            _                      -> pure newState2
+          pure (newState3, finishReason)
+        _ -> pure (toolCallState, finishReason)
 
-    processToolCalls state toolCalls = do
-      V.foldM processToolCallDelta state toolCalls
+    processToolCalls toolCallState toolCalls = do
+      V.foldM processToolCallDelta toolCallState toolCalls
 
-    processToolCallDelta state (Object tcDelta) = do
+    processToolCallDelta toolCallState (Object tcDelta) = do
       case HM.lookup "index" tcDelta of
         Just (Number idx) -> do
           let index = floor idx :: Int
-          let existingTC = HMS.lookupDefault emptyToolCallState index state
+          let existingTC = HMS.lookupDefault emptyToolCallState index toolCallState
 
           -- Update tool call state
           let updatedTC = existingTC
@@ -260,11 +261,11 @@ parseSSEChunks bodyReader = loop BS.empty HMS.empty
             then do
               -- Emit complete tool call
               emitToolCall (index, updatedTC)
-              pure $ HMS.delete index state
+              pure $ HMS.delete index toolCallState
             else
-              pure $ HMS.insert index updatedTC state
-        _ -> pure state
-    processToolCallDelta state _ = pure state
+              pure $ HMS.insert index updatedTC toolCallState
+        _ -> pure toolCallState
+    processToolCallDelta toolCallState _ = pure toolCallState
 
     getFunctionName (Object func) = case HM.lookup "name" func of
       Just (String name) -> Just name
@@ -281,7 +282,8 @@ parseSSEChunks bodyReader = loop BS.empty HMS.empty
     emitToolCall (_, ToolCallBufferState (Just id') (Just name) args) = do
       case eitherDecode (BL.fromStrict $ TE.encodeUtf8 args) of
         Right argsValue -> yield (StreamToolCall $ ToolCall id' name argsValue)
-        Left _ -> pure ()  -- Malformed JSON, skip
+        Left err -> yield (StreamError $ "Tool JSON failed: " <> T.pack err <> " | args: " <> args)
+    emitToolCall (_, toolCallState) = yield (StreamError $ "Incomplete tool call: " <> T.pack (show toolCallState))
     emitToolCall _ = pure ()
 
     isCompleteJSON txt =
@@ -371,15 +373,8 @@ convertRequestToBackend backend chatReq =
           -- Build OpenAI request format
 
           -- Serialise as ```content: "quoted text here"```, rather than ```content: [{"type":"text", "text":"quoted text here"}]```
-          messageContent :: [ContentPart] -> Value
-          messageContent parts = case parts of
-                                   [TextPart text] -> String text
-                                   _               -> toJSON parts
 
-          messagesJson = map (\msg -> object
-            [ "role" .= msgRole msg
-            , "content" .= messageContent (msgContent msg)
-            ]) (reqMessages chatReq)
+          messagesJson = map toJSON (reqMessages chatReq)
 
           -- Do not serialize empty members.
           requestBody = encode $ object $

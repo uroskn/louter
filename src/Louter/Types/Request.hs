@@ -1,6 +1,8 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+{-# LANGUAGE LambdaCase #-}
+
 -- | Request types (Protocol-Agnostic Internal Representation)
 -- All protocol-specific requests convert TO this format
 module Louter.Types.Request
@@ -13,10 +15,10 @@ module Louter.Types.Request
   , defaultChatRequest
   ) where
 
-import Data.Aeson (FromJSON(..), ToJSON(..), Value(..), (.=), object)
+import Data.Aeson (FromJSON(..), ToJSON(..), Value(..), (.=), (.:), (.:?), object, withObject)
 import Data.Aeson.KeyMap (lookup)
 import Data.Text (Text)
-import qualified Data.Vector as V
+import qualified Data.Vector as V (toList)
 import GHC.Generics (Generic)
 import Prelude hiding (lookup)
 
@@ -54,6 +56,8 @@ data ContentPart
       { imageMediaType :: !Text  -- ^ MIME type (e.g., "image/png")
       , imageData :: !Text       -- ^ Base64-encoded image data
       }
+  | ToolCallPart !Text !Text !Text -- ^ id, function name, arguments
+  | ToolResultPart !Text !Text -- ^ toolCallPart id, results
   deriving (Show, Eq, Generic)
 
 instance ToJSON ContentPart where
@@ -67,6 +71,7 @@ instance ToJSON ContentPart where
         [ "url" .= ("data:" <> mediaType <> ";base64," <> dataB64)
         ]
     ]
+  toJSON v = error $ "Attempted to serialize type not supported: " <> show v <> "\n"
 
 instance FromJSON ContentPart where
   parseJSON (Object obj) = case lookup "type" obj of
@@ -87,26 +92,67 @@ data Message = Message
   , msgContent :: ![ContentPart]  -- ^ Changed from Text to [ContentPart]
   } deriving (Show, Eq, Generic)
 
+data MessageToolCall = MessageToolCall
+  {
+    mtcId        :: !Text
+  , mtcName      :: !Text
+  , mtcArguments :: !Text
+  } deriving (Show, Eq, Generic)
+
+instance ToJSON MessageToolCall
+instance FromJSON MessageToolCall
+
 instance FromJSON Message where
   parseJSON (Object obj) = do
-    role <- case lookup "role" obj of
-      Just r -> parseJSON r
-      Nothing -> fail "Missing role"
-    content <- case lookup "content" obj of
-      -- Support both string and array format
-      Just (String txt) -> pure [TextPart txt]
-      Just (Array arr) -> mapM parseJSON (V.toList arr)
-      _ -> fail "Missing or invalid content"
+    role <- obj .: "role"
+    content <- obj .:? "tool_calls" >>= \case -- handle ToolCallPart first
+      Just (Array arr) -> mapM parseToolCall $ V.toList arr
+      _ -> obj .:? "tool_call_id" >>= \case -- then ToolResultPart
+        Just toolCallId -> do
+          text <- obj .: "content"
+          pure [ToolResultPart toolCallId text]
+        Nothing -> obj .:? "content" >>= \case
+          Nothing -> pure []
+          Just Null -> pure []
+          Just (String text) -> pure [TextPart text]
+          Just (Array arr) -> mapM parseJSON $ V.toList arr
+          Just other -> fail $ "Expected Array or String, got: " <> show other
     pure $ Message role content
+      where
+        parseToolCall (Object toolCall) = do
+          id <- toolCall .: "id"
+          function <- toolCall .: "function"
+          name <- function .: "name"
+          arguments <- function .: "arguments"
+          pure $ ToolCallPart id name arguments
+        parseToolCall other = fail $ "Expected object, got: " <> show other
   parseJSON _ = fail "Expected object for Message"
 
 instance ToJSON Message where
-  toJSON (Message role content) = object
-    [ "role" .= role
-    , "content" .= case content of
-        [TextPart txt] -> String txt  -- Simplify single text to string
-        parts -> toJSON parts         -- Multiple parts as array
-    ]
+  toJSON msg = case msgContent msg of
+                 [ToolCallPart id name args] ->
+                   object [ "role"       .= msgRole msg
+                          , "content"    .= Null
+                          , "tool_calls" .= [ object [ "id" .= id
+                                                     , "type" .= ( "function" :: Text )
+                                                     , "function" .= object [ "name" .= name
+                                                                            , "arguments" .= args
+                                                                            ]
+                                                     ]
+                                            ]
+                          ]
+                 [ToolResultPart id content] ->
+                   object [ "role"         .= msgRole msg
+                          , "tool_call_id" .= id
+                          , "content"      .= content
+                          ]
+                 parts ->
+                   object [ "role"    .= msgRole msg
+                          , "content" .= stringOrArray (msgContent msg)
+                          ]
+    where
+      stringOrArray [TextPart text] = String text -- Simplify single text to string
+      stringOrArray parts = toJSON parts          -- Multiple parts as array
 
 -- | Message role
 data MessageRole
@@ -137,7 +183,13 @@ data Tool = Tool
   , toolParameters :: !Value       -- ^ JSON Schema for parameters
   } deriving (Show, Eq, Generic)
 
-instance FromJSON Tool
+instance FromJSON Tool where
+  parseJSON = withObject "Tool" $ \obj -> do
+    func <- obj .: "function"
+    Tool
+      <$> func .: "name"
+      <*> func .:? "description"
+      <*> func .: "parameters"
 
 instance ToJSON Tool where
   toJSON t = object
