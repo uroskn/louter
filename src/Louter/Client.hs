@@ -219,7 +219,7 @@ parseSSEChunks bodyReader = loop BS.empty (HMS.empty, "stop")
           -- Handle content
           newState1 <- case HM.lookup "content" delta of
             Just (String "")      -> do
-              liftIO $ putStrLn $ "Warning: Empty content: " <> show delta
+              -- liftIO $ putStrLn $ "Warning: Empty content: " <> show delta
               pure toolCallState -- handle tool calls being sent with content ""
             Just (String content) -> yield (StreamContent content) >> pure toolCallState
             _                     -> pure toolCallState
