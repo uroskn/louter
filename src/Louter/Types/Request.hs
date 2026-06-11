@@ -130,17 +130,21 @@ instance FromJSON Message where
 
 instance ToJSON Message where
   toJSON msg = case msgContent msg of
-                 [ToolCallPart id name args] ->
+                 parts | not (null toolCalls) ->
                    object [ "role"       .= msgRole msg
                           , "content"    .= Null
-                          , "tool_calls" .= [ object [ "id" .= id
-                                                     , "type" .= ( "function" :: Text )
-                                                     , "function" .= object [ "name" .= name
-                                                                            , "arguments" .= args
-                                                                            ]
-                                                     ]
-                                            ]
+                          , "tool_calls" .= map formatToolCall toolCalls
                           ]
+                     where
+                       toolCalls = [p | p@(ToolCallPart _ _ _) <- parts]
+                       formatToolCall (ToolCallPart callId name args) =
+                         object [ "id"       .= callId
+                                , "type"     .= ("function" :: Text)
+                                , "function" .= object [ "name"      .= name
+                                                       , "arguments" .= args
+                                                       ]
+                                ]
+                       formatToolCall _ = error "impossible" 
                  [ToolResultPart id content] ->
                    object [ "role"         .= msgRole msg
                           , "tool_call_id" .= id
