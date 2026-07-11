@@ -15,7 +15,9 @@ module Louter.Types.Request
   , defaultChatRequest
   ) where
 
+import Control.Applicative ((<|>))
 import Data.Aeson (FromJSON(..), ToJSON(..), Value(..), (.=), (.:), (.:?), object, withObject)
+import Data.Aeson.Types (Pair)
 import Data.Aeson.KeyMap (lookup)
 import Data.Text (Text)
 import qualified Data.Vector as V (toList)
@@ -86,10 +88,11 @@ instance FromJSON ContentPart where
     _ -> fail "Unknown content part type"
   parseJSON _ = fail "Expected object for ContentPart"
 
--- | Message in a conversation
+-- | Chat message with optional reasoning/chain-of-thought support
 data Message = Message
   { msgRole :: !MessageRole
-  , msgContent :: ![ContentPart]  -- ^ Changed from Text to [ContentPart]
+  , msgContent :: ![ContentPart]
+  , msgReasoning :: !(Maybe Text)  -- ^ Optional reasoning/chain-of-thought (e.g. o1 series)
   } deriving (Show, Eq, Generic)
 
 data MessageToolCall = MessageToolCall
@@ -117,24 +120,34 @@ instance FromJSON Message where
           Just (String text) -> pure [TextPart text]
           Just (Array arr) -> mapM parseJSON $ V.toList arr
           Just other -> fail $ "Expected Array or String, got: " <> show other
-    pure $ Message role content
-      where
-        parseToolCall (Object toolCall) = do
-          id <- toolCall .: "id"
-          function <- toolCall .: "function"
-          name <- function .: "name"
-          arguments <- function .: "arguments"
-          pure $ ToolCallPart id name arguments
-        parseToolCall other = fail $ "Expected object, got: " <> show other
+    -- Parse reasoning from either "reasoning_content" or "reasoning" key
+    rc <- obj .:? "reasoning_content"
+    r  <- obj .:? "reasoning"
+    let reasoning = rc <|> r
+    pure $ Message role content reasoning
+    where
+      parseToolCall (Object toolCall) = do
+        id <- toolCall .: "id"
+        function <- toolCall .: "function"
+        name <- function .: "name"
+        arguments <- function .: "arguments"
+        pure $ ToolCallPart id name arguments
+      parseToolCall other = fail $ "Expected object, got: " <> show other
   parseJSON _ = fail "Expected object for Message"
+
+-- | Helper: emit reasoning fields for both "reasoning_content" and "reasoning" when present
+reasoningFields :: Message -> [Pair]
+reasoningFields m = case msgReasoning m of
+    Just r  -> ["reasoning_content" .= r, "reasoning" .= r]
+    Nothing -> []
 
 instance ToJSON Message where
   toJSON msg = case msgContent msg of
                  parts | not (null toolCalls) ->
-                   object [ "role"       .= msgRole msg
-                          , "content"    .= Null
-                          , "tool_calls" .= map formatToolCall toolCalls
-                          ]
+                   object ([ "role"       .= msgRole msg
+                           , "content"    .= Null
+                           , "tool_calls" .= map formatToolCall toolCalls
+                           ] ++ reasoningFields msg)
                      where
                        toolCalls = [p | p@(ToolCallPart _ _ _) <- parts]
                        formatToolCall (ToolCallPart callId name args) =
@@ -151,9 +164,9 @@ instance ToJSON Message where
                           , "content"      .= content
                           ]
                  parts ->
-                   object [ "role"    .= msgRole msg
-                          , "content" .= stringOrArray (msgContent msg)
-                          ]
+                   object ([ "role"    .= msgRole msg
+                           , "content" .= stringOrArray (msgContent msg)
+                           ] ++ reasoningFields msg)
     where
       stringOrArray [TextPart text] = String text -- Simplify single text to string
       stringOrArray parts = toJSON parts          -- Multiple parts as array
